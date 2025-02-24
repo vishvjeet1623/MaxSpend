@@ -1,207 +1,76 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.0;
 
-
-interface IERC20 {
-    function transferFrom(address from, address to, uint256 value) external returns (bool);
-    function transfer(address to, uint256 value) external returns (bool);
-    function balanceOf(address account) external view returns (uint256);
-}
-
-contract MaxSpend {
+contract SharedWallet {
     address public owner;
-    bool private locked;
+    mapping(address => bool) public isAllowedToSpend;
+    mapping(address => uint256) public spendingLimit;
+    mapping(address => uint256) public dailySpent;
+    mapping(address => uint256) public lastSpendTimestamp;
 
-    
-    mapping(string => address) public supportedTokens;
-    
-   
-    mapping(string => uint256) public withdrawalLimits;
-    
-   
-    mapping(string => uint256) public dailyWithdrawals;
-    
-   
-    uint256 public lastResetTimestamp;
-    
-    
-    event Deposited(address indexed user, string token, uint256 amount);
-    event Withdrawn(address indexed user, string token, uint256 amount);
-    event Transferred(address indexed from, address indexed to, string token, uint256 amount);
-    event LimitsUpdated(string token, uint256 newLimit);
-    event TokenAdded(string symbol, address tokenAddress);
-
-    
-    error NotOwner();
-    error AlreadySupported();
-    error InvalidToken();
-    error InvalidAmount();
-    error InvalidRecipient();
-    error InsufficientBalance();
-    error LimitExceeded();
-    error TransferFailed();
-
-    modifier onlyOwner() {
-        if (msg.sender != owner) revert NotOwner();
-        _;
-    }
-
-    modifier noReentrant() {
-        require(!locked, "No re-entrancy");
-        locked = true;
-        _;
-        locked = false;
-    }
+    event Deposit(address indexed sender, uint256 amount);
+    event Withdrawal(address indexed recipient, uint256 amount);
+    event SpenderAdded(address indexed spender, uint256 limit);
+    event SpenderRemoved(address indexed spender);
 
     constructor() {
         owner = msg.sender;
-       
-        supportedTokens["ETH"] = address(0); 
-        withdrawalLimits["ETH"] = 5 ether;   
-        
-        
-        lastResetTimestamp = block.timestamp - (block.timestamp % 1 days);
+        isAllowedToSpend[msg.sender] = true;
     }
 
-    
-    function addToken(string memory symbol, address tokenAddress, uint256 initialLimit) 
-        external 
-        onlyOwner 
-    {
-        if(supportedTokens[symbol] != address(0)) revert AlreadySupported();
-        if(tokenAddress == address(0)) revert InvalidToken();
-        
-        supportedTokens[symbol] = tokenAddress;
-        withdrawalLimits[symbol] = initialLimit;
-        emit TokenAdded(symbol, tokenAddress);
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call this function");
+        _;
     }
 
-    
-    function setWithdrawalLimit(string memory token, uint256 newLimit) 
-        external 
-        onlyOwner 
-    {
-        if(supportedTokens[token] == address(0)) revert InvalidToken();
-        withdrawalLimits[token] = newLimit;
-        emit LimitsUpdated(token, newLimit);
-    }
-
-    
-    function checkAndResetDaily() internal {
-        uint256 currentDay = block.timestamp - (block.timestamp % 1 days);
-        if (currentDay > lastResetTimestamp) {
-            lastResetTimestamp = currentDay;
-            dailyWithdrawals["ETH"] = 0;
-            dailyWithdrawals["USDT"] = 0;
-            dailyWithdrawals["USDC"] = 0;
-            dailyWithdrawals["DAI"] = 0;
+    modifier canSpend(uint256 _amount) {
+        require(isAllowedToSpend[msg.sender], "Not authorized to spend");
+        if (msg.sender != owner) {
+            require(_amount <= spendingLimit[msg.sender], "Amount exceeds spending limit");
+            
+            // Reset daily spent if 24 hours have passed
+            if (block.timestamp >= lastSpendTimestamp[msg.sender] + 1 days) {
+                dailySpent[msg.sender] = 0;
+            }
+            
+            require(dailySpent[msg.sender] + _amount <= spendingLimit[msg.sender], 
+                    "Daily spending limit exceeded");
         }
+        _;
     }
 
-   
-    function deposit() external payable {
-        if(msg.value == 0) revert InvalidAmount();
-        emit Deposited(msg.sender, "ETH", msg.value);
+    receive() external payable {
+        emit Deposit(msg.sender, msg.value);
     }
 
-    function depositToken(string memory token, uint256 amount) external {
-        address tokenAddress = supportedTokens[token];
-        if(tokenAddress == address(0)) revert InvalidToken();
-        if(amount == 0) revert InvalidAmount();
-
-        bool success = IERC20(tokenAddress).transferFrom(msg.sender, address(this), amount);
-        if(!success) revert TransferFailed();
-        emit Deposited(msg.sender, token, amount);
+    function addSpender(address _spender, uint256 _limit) external onlyOwner {
+        isAllowedToSpend[_spender] = true;
+        spendingLimit[_spender] = _limit;
+        emit SpenderAdded(_spender, _limit);
     }
 
-    
-    function withdraw(uint256 amount) external noReentrant {
-        if(amount == 0) revert InvalidAmount();
-        if(address(this).balance < amount) revert InsufficientBalance();
+    function removeSpender(address _spender) external onlyOwner {
+        require(_spender != owner, "Cannot remove owner");
+        isAllowedToSpend[_spender] = false;
+        spendingLimit[_spender] = 0;
+        emit SpenderRemoved(_spender);
+    }
+
+    function withdraw(uint256 _amount) external canSpend(_amount) {
+        require(address(this).balance >= _amount, "Insufficient balance");
         
-        checkAndResetDaily();
-        if(dailyWithdrawals["ETH"] + amount > withdrawalLimits["ETH"]) 
-            revert LimitExceeded();
+        if (msg.sender != owner) {
+            dailySpent[msg.sender] += _amount;
+            lastSpendTimestamp[msg.sender] = block.timestamp;
+        }
 
-        dailyWithdrawals["ETH"] += amount;
-        (bool success, ) = payable(msg.sender).call{value: amount}("");
-        if(!success) revert TransferFailed();
+        (bool success, ) = payable(msg.sender).call{value: _amount}("");
+        require(success, "Transfer failed");
         
-        emit Withdrawn(msg.sender, "ETH", amount);
+        emit Withdrawal(msg.sender, _amount);
     }
 
-    
-    function withdrawToken(string memory token, uint256 amount) external noReentrant {
-        address tokenAddress = supportedTokens[token];
-        if(tokenAddress == address(0)) revert InvalidToken();
-        if(amount == 0) revert InvalidAmount();
-        
-        checkAndResetDaily();
-        if(dailyWithdrawals[token] + amount > withdrawalLimits[token])
-            revert LimitExceeded();
-
-        dailyWithdrawals[token] += amount;
-        bool success = IERC20(tokenAddress).transfer(msg.sender, amount);
-        if(!success) revert TransferFailed();
-        
-        emit Withdrawn(msg.sender, token, amount);
-    }
-
-    
-    function transfer(address to, uint256 amount) external noReentrant {
-        if(to == address(0)) revert InvalidRecipient();
-        if(amount == 0) revert InvalidAmount();
-        if(address(this).balance < amount) revert InsufficientBalance();
-
-        (bool success, ) = payable(to).call{value: amount}("");
-        if(!success) revert TransferFailed();
-        
-        emit Transferred(msg.sender, to, "ETH", amount);
-    }
-
-   
-    function transferToken(string memory token, address to, uint256 amount) 
-        external 
-        noReentrant 
-    {
-        address tokenAddress = supportedTokens[token];
-        if(tokenAddress == address(0)) revert InvalidToken();
-        if(to == address(0)) revert InvalidRecipient();
-        if(amount == 0) revert InvalidAmount();
-
-        bool success = IERC20(tokenAddress).transfer(to, amount);
-        if(!success) revert TransferFailed();
-        
-        emit Transferred(msg.sender, to, token, amount);
-    }
-
-    
     function getBalance() external view returns (uint256) {
         return address(this).balance;
-    }
-
-    
-    function getTokenBalance(string memory token) external view returns (uint256) {
-        address tokenAddress = supportedTokens[token];
-        if(tokenAddress == address(0)) revert InvalidToken();
-        return IERC20(tokenAddress).balanceOf(address(this));
-    }
-
-    
-    function getRemainingDailyLimit(string memory token) 
-        external 
-        view 
-        returns (uint256) 
-    {
-        if(supportedTokens[token] == address(0)) revert InvalidToken();
-        if (block.timestamp - lastResetTimestamp >= 1 days) {
-            return withdrawalLimits[token];
-        }
-        return withdrawalLimits[token] - dailyWithdrawals[token];
-    }
-
-    
-    receive() external payable {
-        emit Deposited(msg.sender, "ETH", msg.value);
     }
 }
